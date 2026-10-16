@@ -1,5 +1,7 @@
+import { createHash } from 'node:crypto';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { basename, extname, resolve } from 'node:path';
 import type { Plugin, Rollup } from 'vite';
 import type { Integration } from './integrations/index.ts';
 import {
@@ -139,7 +141,8 @@ export function vitePluginAstroBuildPrerender(options: FrameworkOptions): Plugin
         trackedSpecifiers,
         resolveFrom,
         fonts: options.fonts,
-        bundle
+        bundle,
+        outDir
       });
 
       await writePrerenderedStoriesFile(outDir, prerenderedStories);
@@ -165,6 +168,7 @@ async function prerenderAstroStories(options: {
   resolveFrom: string;
   fonts?: FrameworkOptions['fonts'];
   bundle: Rollup.OutputBundle;
+  outDir: string;
 }) {
   const runtime = await createProductionRenderRuntime({
     integrations: options.integrations,
@@ -197,7 +201,7 @@ async function prerenderAstroStories(options: {
       // Image asset URLs from Vite SSR still point at /@fs/ paths, so rewrite
       // them first; then rewrite hydrated framework component module paths and
       // prepend their extracted CSS so the static preview matches dev styling.
-      const htmlWithAssetUrls = rewriteAssetPaths(html, assetPathMap, publicDir);
+      const htmlWithAssetUrls = rewriteAssetPaths(html, assetPathMap, publicDir, options.outDir);
       const htmlWithBuiltModules = rewriteBuiltModulePaths(
         htmlWithAssetUrls,
         options.staticModuleMap
@@ -243,7 +247,7 @@ async function collectAstroStories(outDir: string): Promise<ProductionStoryEntry
 }
 
 /** Builds lookup tables that map original asset paths to emitted static asset URLs. */
-function buildAssetPathMap(bundle: Rollup.OutputBundle): Map<string, string> {
+export function buildAssetPathMap(bundle: Rollup.OutputBundle): Map<string, string> {
   const exactMap = new Map<string, string>();
   const stemMap = new Map<string, string>();
 
@@ -260,16 +264,12 @@ function buildAssetPathMap(bundle: Rollup.OutputBundle): Map<string, string> {
       }
     }
 
-    // Vite does not populate originalFileNames for image assets processed
-    // through its asset pipeline. Build a secondary lookup by the filename
-    // stem so /@fs/ URLs in prerendered HTML can still be mapped to their
-    // content-hashed output paths.  e.g. "storybook-astro-CfMmZdup.png" ⟶
-    // stem key "storybook-astro.png" ⟶ "/_astro/storybook-astro-CfMmZdup.png".
-    const baseName = asset.fileName.split('/').pop() ?? '';
-    const stemMatch = baseName.match(/^(.+)-[A-Za-z0-9]{6,12}\.(png|jpe?g|gif|webp|svg|avif|ico)$/);
-
-    if (stemMatch) {
-      stemMap.set(`${stemMatch[1]}.${stemMatch[2]}`, `/${asset.fileName}`);
+    // Images emitted by Astro's asset pipeline carry no originalFileNames, so
+    // also index every asset by the file name it was emitted from, e.g.
+    // "photo.webp" ⟶ "/_astro/photo-CG2UH-wI.webp". The hashed output name is
+    // not parsed for this: the hash itself can contain `-` and `_`.
+    for (const name of asset.names) {
+      stemMap.set(name, `/${asset.fileName}`);
     }
   }
 
@@ -280,7 +280,8 @@ function buildAssetPathMap(bundle: Rollup.OutputBundle): Map<string, string> {
 export function rewriteAssetPaths(
   html: string,
   assetPathMap: ReturnType<typeof buildAssetPathMap>,
-  publicDir: string
+  publicDir: string,
+  outDir: string
 ): string {
   const { exactMap, stemMap } = assetPathMap as unknown as {
     exactMap: Map<string, string>;
@@ -318,6 +319,29 @@ export function rewriteAssetPaths(
       return absolutePath.slice(publicDir.length);
     }
 
-    return match;
+    // Anything else was only imported on the server — an image a component
+    // passes to <Image> or getImage() itself, a `?url` import — so the build
+    // never emitted it. Copy it into the output instead.
+    return copyAssetToOutDir(absolutePath, outDir) ?? match;
   });
+}
+
+/** Copies a file into `_astro/` under a content-hashed name and returns its URL, if it exists. */
+function copyAssetToOutDir(filePath: string, outDir: string): string | undefined {
+  let source: Buffer;
+
+  try {
+    source = readFileSync(filePath);
+  } catch {
+    return undefined;
+  }
+
+  const extension = extname(filePath);
+  const hash = createHash('sha256').update(source).digest('hex').slice(0, 8);
+  const fileName = `_astro/${basename(filePath, extension)}-${hash}${extension}`;
+
+  mkdirSync(resolve(outDir, '_astro'), { recursive: true });
+  writeFileSync(resolve(outDir, fileName), source);
+
+  return `/${fileName}`;
 }

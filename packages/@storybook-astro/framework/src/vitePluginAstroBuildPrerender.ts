@@ -250,6 +250,7 @@ async function collectAstroStories(outDir: string): Promise<ProductionStoryEntry
 export function buildAssetPathMap(bundle: Rollup.OutputBundle): Map<string, string> {
   const exactMap = new Map<string, string>();
   const stemMap = new Map<string, string>();
+  const ambiguousNames = new Set<string>();
 
   for (const chunk of Object.values(bundle)) {
     if (chunk.type !== 'asset') {
@@ -269,8 +270,20 @@ export function buildAssetPathMap(bundle: Rollup.OutputBundle): Map<string, stri
     // "photo.webp" ⟶ "/_astro/photo-CG2UH-wI.webp". The hashed output name is
     // not parsed for this: the hash itself can contain `-` and `_`.
     for (const name of asset.names) {
-      stemMap.set(name, `/${asset.fileName}`);
+      const emittedPath = `/${asset.fileName}`;
+
+      if (stemMap.has(name) && stemMap.get(name) !== emittedPath) {
+        ambiguousNames.add(name);
+      }
+      stemMap.set(name, emittedPath);
     }
+  }
+
+  // Two different files with the same name (say `icons/logo.png` and
+  // `brand/logo.png`) can't be told apart by name alone. Drop those names so
+  // their URLs fall through to the copy below rather than to the wrong image.
+  for (const name of ambiguousNames) {
+    stemMap.delete(name);
   }
 
   return { exactMap, stemMap } as unknown as Map<string, string>;
@@ -326,8 +339,18 @@ export function rewriteAssetPaths(
   });
 }
 
-/** Copies a file into `_astro/` under a content-hashed name and returns its URL, if it exists. */
+// File types the copy fallback may publish. Anything else behind a `/@fs/` URL
+// (a component's `.astro` or `.tsx` source, say) is a missed rewrite, and
+// copying it would publish source code without fixing the reference.
+const COPYABLE_ASSET_RE =
+  /\.(apng|avif|bmp|gif|ico|jfif|jpe?g|pjp(eg)?|png|svg|tiff?|webp|cur|mp4|webm|ogg|mp3|wav|flac|aac|opus|mov|m4a|vtt|woff2?|eot|ttf|otf|pdf|txt|webmanifest)$/i;
+
+/** Copies an asset file into `_astro/` under a content-hashed name and returns its URL, if it exists. */
 function copyAssetToOutDir(filePath: string, outDir: string): string | undefined {
+  if (!COPYABLE_ASSET_RE.test(filePath)) {
+    return undefined;
+  }
+
   let source: Buffer;
 
   try {

@@ -102,3 +102,64 @@ test('leaves an unmatched /@fs/ path that does not exist on disk untouched', () 
 
   expect(rewriteAssetPaths(html, assetMap({}), PUBLIC_DIR, OUT_DIR)).toBe(html);
 });
+
+test('copies the referenced image when two different emitted images share its file name', async () => {
+  // Matching by name alone would point both references at whichever
+  // `logo.png` happened to be emitted last.
+  const projectDir = await mkdtemp(join(tmpdir(), 'storybook-astro-prerender-test-'));
+  const outDir = join(projectDir, 'storybook-static');
+  const brandLogoPath = join(projectDir, 'src', 'brand', 'logo.png');
+  const bundle = {
+    '_astro/logo-AAAAAAAA.png': {
+      type: 'asset',
+      fileName: '_astro/logo-AAAAAAAA.png',
+      names: ['logo.png'],
+      originalFileNames: [],
+      source: new Uint8Array()
+    },
+    '_astro/logo-BBBBBBBB.png': {
+      type: 'asset',
+      fileName: '_astro/logo-BBBBBBBB.png',
+      names: ['logo.png'],
+      originalFileNames: [],
+      source: new Uint8Array()
+    }
+  };
+
+  try {
+    await mkdir(join(projectDir, 'src', 'brand'), { recursive: true });
+    await writeFile(brandLogoPath, 'brand logo bytes');
+
+    const result = rewriteAssetPaths(
+      `<img src="/@fs${brandLogoPath}">`,
+      buildAssetPathMap(bundle as never),
+      join(projectDir, 'public'),
+      outDir
+    );
+    const [copiedFile] = await readdir(join(outDir, '_astro'));
+
+    expect(result).toBe(`<img src="/_astro/${copiedFile}">`);
+    expect(await readFile(join(outDir, '_astro', copiedFile), 'utf-8')).toBe('brand logo bytes');
+  } finally {
+    await rm(projectDir, { recursive: true, force: true });
+  }
+});
+
+test('never publishes component source behind an unmatched /@fs/ URL', async () => {
+  // A missed island rewrite must stay visibly broken, not ship its source code.
+  const projectDir = await mkdtemp(join(tmpdir(), 'storybook-astro-prerender-test-'));
+  const outDir = join(projectDir, 'storybook-static');
+  const componentPath = join(projectDir, 'src', 'Counter.tsx');
+
+  try {
+    await mkdir(join(projectDir, 'src'), { recursive: true });
+    await writeFile(componentPath, 'export default function Counter() {}');
+
+    const html = `<astro-island component-url="/@fs${componentPath}"></astro-island>`;
+
+    expect(rewriteAssetPaths(html, assetMap({}), join(projectDir, 'public'), outDir)).toBe(html);
+    await expect(readdir(join(outDir, '_astro'))).rejects.toThrow();
+  } finally {
+    await rm(projectDir, { recursive: true, force: true });
+  }
+});
